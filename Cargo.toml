@@ -1,0 +1,11 @@
+[package]
+name = "test_inheritance"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+async-trait = "0.1.88"
+
+[dependencies.tokio]
+version = "1.42.0"
+features = ["full"]
