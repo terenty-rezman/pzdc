@@ -1,5 +1,6 @@
-use std::sync::Arc;
-use tokio::sync::RwLock;
+use std::collections::HashMap;
+use std::sync::{Arc, LazyLock, RwLock as StdRwLock};
+use tokio::{net::tcp, sync::RwLock};
 
 use async_trait::async_trait;
 use tokio::sync::mpsc;
@@ -8,7 +9,7 @@ struct Button {
     name: String,
     state: i32,
     dataref: String,
-    tcp_send: tokio::sync::mpsc::Sender<String>,
+    tcp_send: tokio::sync::mpsc::Sender<(String, i32)>,
 }
 
 trait AsButton {
@@ -20,20 +21,21 @@ trait AsButton {
 trait ButtonTrait: AsButton + Send + Sync {
     fn get_state(&self) -> i32 {
         let btn = self.as_button();
-        btn.state
+        PARAMS_STATE.get(btn.dataref.as_str())
     }
 
     fn name(&self) -> &str {
         let btn = self.as_button();
-        &btn.name
+        &btn.dataref
     }
 
     async fn set_state(&mut self, state: i32) {
         let btn = self.as_button_mut();
-        btn.state = state;
 
-        let command = format!("set {} {}", btn.dataref, btn.state);
-        btn.tcp_send.send(command).await.unwrap();
+        btn.tcp_send
+            .send((btn.dataref.clone(), state))
+            .await
+            .unwrap();
     }
 }
 
@@ -68,6 +70,20 @@ struct RedButton {
     color: String,
 }
 
+impl RedButton {
+    fn new(tcp_send: tokio::sync::mpsc::Sender<(String, i32)>) -> Self {
+        Self {
+            button: Button {
+                name: "red_btn".into(),
+                state: 0,
+                dataref: "red_dataref".into(),
+                tcp_send,
+            },
+            color: "red".into(),
+        }
+    }
+}
+
 quick_impl!(RedButton, AsButton);
 
 #[async_trait]
@@ -83,53 +99,93 @@ struct GreenButton {
     color: String,
 }
 
-quick_impl!(GreenButton, AsButton);
-impl ButtonTrait for GreenButton {}
-
-#[tokio::main]
-async fn main() {
-    let (tcp_send, mut rx) = mpsc::channel::<String>(32);
-
-    tokio::spawn(async move {
-        while let Some(message) = rx.recv().await {
-            println!("send tcp {}", message);
-        }
-    });
-
-    let buttons: Arc<RwLock<[Box<dyn ButtonTrait>; 2]>> = Arc::new(RwLock::new([
-        Box::new(RedButton {
-            button: Button {
-                name: "red_btn".into(),
-                state: 0,
-                dataref: "red_dataref".into(),
-                tcp_send: tcp_send.clone(),
-            },
-            color: "red".into(),
-        }),
-        Box::new(GreenButton {
+impl GreenButton {
+    fn new(tcp_send: tokio::sync::mpsc::Sender<(String, i32)>) -> Self {
+        Self {
             button: Button {
                 name: "green_btn".into(),
                 state: 0,
-                dataref: "green_ref".into(),
-                tcp_send: tcp_send.clone(),
+                dataref: "green_dataref".into(),
+                tcp_send,
             },
             color: "green".into(),
-        }),
-    ]));
+        }
+    }
+}
+
+quick_impl!(GreenButton, AsButton);
+impl ButtonTrait for GreenButton {}
+
+struct ParamsState {
+    params_state: StdRwLock<HashMap<&'static str, f32>>,
+}
+
+impl ParamsState {
+    fn get(&self, param_name: &str) -> i32 {
+        *self.params_state.read().unwrap().get(param_name).unwrap() as i32
+    }
+
+    fn set(&self, param_name: &str, value: i32) {
+        *self.params_state.write()
+        .unwrap()
+        .get_mut(param_name)
+        .unwrap() = value as f32;
+    }
+}
+
+static PARAMS_STATE: LazyLock<ParamsState> = LazyLock::new(|| ParamsState {
+    params_state: StdRwLock::new(HashMap::from([
+        ("red_dataref", 10f32),
+        ("green_dataref", 11f32),
+    ])),
+});
+
+#[tokio::main]
+async fn main() {
+    let (tcp_send, mut rx) = mpsc::channel::<(String, i32)>(32);
+
+    tokio::spawn(async move {
+        while let Some(message) = rx.recv().await {
+            println!("send tcp {} {}", message.0, message.1);
+            PARAMS_STATE.set(message.0.as_str(), message.1);
+        }
+    });
+
+    let buttons: Arc<RwLock<HashMap<&str, Box<dyn ButtonTrait>>>> =
+        Arc::new(RwLock::new(HashMap::from([
+            (
+                "red_btn",
+                Box::new(RedButton::new(tcp_send.clone())) as Box<dyn ButtonTrait>,
+            ),
+            ("green_btn", Box::new(GreenButton::new(tcp_send.clone()))),
+        ])));
 
     let buttons_clone = buttons.clone();
     tokio::spawn(async move {
-        let buttons = &*buttons_clone.read().await;
-        for b in buttons {
-            println!("send state udp {} {}", b.name(), b.get_state());
+        loop {
+            let buttons = &*buttons_clone.read().await;
+            for b in buttons.values() {
+                println!("send state udp {} {}", b.name(), b.get_state());
+            }
         }
     });
 
     let buttons_clone = buttons.clone();
     tokio::spawn(async move {
-        let buttons = &mut *buttons_clone.write().await;
-        for b in buttons {
-            b.set_state(1).await;
+        loop {
+            let buttons = &mut *buttons_clone.write().await;
+            buttons.get_mut("green_btn").unwrap().set_state(0).await;
+            buttons.get_mut("red_btn").unwrap().set_state(0).await;
+        }
+    });
+
+    let buttons_clone = buttons.clone();
+    tokio::spawn(async move {
+        loop {
+            let buttons = &mut *buttons_clone.write().await;
+            for b in buttons.values_mut() {
+                b.set_state(1).await;
+            }
         }
     })
     .await
